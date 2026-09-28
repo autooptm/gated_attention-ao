@@ -1,3 +1,75 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>Gated Attention · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>3.80x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-3.80x-2ea44f"></a>
+    <a href="https://github.com/qiuzh20/gated_attention/commit/f4c2a5f6ffd6ec709e0c60072c95ed4f5ce5b5d2"><img alt="base" src="https://img.shields.io/badge/upstream-f4c2a5f6ffd6-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [qiuzh20/gated_attention](https://github.com/qiuzh20/gated_attention) at commit
+> [`f4c2a5f6ffd6`](https://github.com/qiuzh20/gated_attention/commit/f4c2a5f6ffd6ec709e0c60072c95ed4f5ce5b5d2) with the AutoOptm patch applied on top.
+> **What is measured is a text-generation mode this fork adds to `demo.py`.** Upstream's `python demo.py`
+> loads the three 1.7B checkpoints, runs one 11-token forward through each and saves attention-map
+> figures; that command is unchanged here. The new, opt-in `python demo.py --generate --prompts FILE`
+> runs the `1B_gate_headwise` checkpoint through `transformers`' `generate()` over a file of prompts.
+> That mode is what was measured, and the "before" figure is the same mode without the optimisation.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept verbatim at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python demo.py --generate --prompts prompts.txt` (32 real-text prompts of 140-610 tokens, 96 new tokens each, batch 1, `1B_gate_headwise`) |
+| **Entry point** | `demo.py` (the `--generate` mode is added by this fork; `python demo.py` with no arguments is upstream's attention-map demo, unchanged) |
+| **Unit measured** | one prompt: tokenize → greedy generation of 96 new tokens → decode → one line written to the output file |
+| **Before (the same mode, without the optimisation)** | 2,776 ms per prompt (90.61 s for the timed loop; 101.75 s for the whole run including startup) |
+| **After (this tree, all switches default ON)** | 735 ms per prompt (23.85 s for the timed loop; 34.07 s for the whole run including startup) |
+| **Speedup** | **3.80x** end to end on RTX 4090 (timed loop; per prompt 3.78x, whole run including startup 2.99x), noise floor of the host 0.48% |
+| **Output** | next-token probabilities within 0.0078 (max absolute difference) of the stock program's, relative L2 0.0028, PSNR 62 dB; verified on the pinned prompts and on held-out prompts the optimiser never saw (max difference 0.0075, worst 1% trimmed) |
+
+### What changed
+
+| File | Where | Gain |
+|---|---|---|
+| `modeling_qwen3.py`, `ao_fast_decode.py` (new) | `Qwen3RMSNorm.forward` | 1.245x |
+| `ao_fast_decode.py` (new) | `install()` | 1.04x |
+| `ao_fast_decode.py` (new) | `_FastDecode` | 1.60x |
+| `demo.py` | `generate_demo()` | 1.94x |
+| `demo.py` | `main()` / `generate_demo()` / `read_prompts()`: the new `--generate` mode | — (how the run is measured) |
+
+Each gain is measured on top of the rows above it. The checkpoints on the Hugging Face Hub carry
+their own copy of `modeling_qwen3.py` (loaded with `trust_remote_code`), which is why
+`ao_fast_decode.py` applies the change to whichever copy is loaded. Everything above affects the
+`--generate` mode only; every change is behind a switch that defaults on (see
+[`.autooptm/autooptm.patch`](.autooptm/autooptm.patch)).
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/gated_attention-ao.git
+cd gated_attention-ao
+pip install "transformers==4.46.3" accelerate matplotlib safetensors
+# put the 1B_gate_headwise checkpoint from QwQZh/gated_attention on the Hub in ./1B_gate_headwise, then,
+# with any text file of one prompt per line:
+python demo.py --generate --prompts prompts.txt
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff f4c2a5f6ffd6` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 # Gated Attention: Implementation and Visualization
 
 This repository contains the implementation of **gated attention** mechanisms based on [Qwen3](https://github.com/QwenLM/Qwen3) model architecture, along with tools for visualizing attention maps. Our modifications are based on findings from recent research that demonstrate how applying **sparse, head-specific gating after Scaled Dot-Product Attention (SDPA)** can significantly improve performance, training stability, and long-context generalization. More details are in our paper [Gated Attention for Large Language Models: Non-linearity, Sparsity, and Attention-Sink-Free](https://arxiv.org/abs/2505.06708).

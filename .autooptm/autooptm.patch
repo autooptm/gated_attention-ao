@@ -1,0 +1,620 @@
+diff --git a/ao_fast_decode.py b/ao_fast_decode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f09cdad4842cfbc2dd7ef2851e3c3c579ffbcb1
+--- /dev/null
++++ b/ao_fast_decode.py
+@@ -0,0 +1,292 @@
++import contextlib
++import os
++import sys
++
++import torch
++
++_ENABLED = os.environ.get('GATED_ATTENTION_FAST', '1') != '0'
++_TOLERANCE = 1e-2
++
++
++def _warn(message):
++    sys.stderr.write('[gated_attention] fast decode disabled: %s\n' % message)
++    sys.stderr.flush()
++
++
++def _ensure_opt_model_paths(model, patch):
++    import torch.nn.functional as F
++
++    norms = [m for m in model.modules() if m.__class__.__name__ == 'Qwen3RMSNorm']
++    if norms and hasattr(F, 'rms_norm'):
++        cls = type(norms[0])
++        if 'rms_norm' not in cls.forward.__code__.co_names:
++            def rms_forward(self, hidden_states):
++                return F.rms_norm(hidden_states, (hidden_states.shape[-1],),
++                                  self.weight, self.variance_epsilon)
++            patch(cls, 'forward', rms_forward)
++
++    rotary = [m for m in model.modules()
++              if m.__class__.__name__ == 'Qwen3RotaryEmbedding'
++              and getattr(m, 'inv_freq', None) is not None]
++    if rotary and 'dynamic' not in str(getattr(rotary[0], 'rope_type', 'default')):
++        cls = type(rotary[0])
++        if '_ao_rope_table' not in cls.forward.__code__.co_names:
++            tables = {}
++
++            def rope_forward(self, x, position_ids):
++                key = (str(x.device), x.dtype)
++                entry = tables.get(key)
++                if entry is None:
++                    length = min(int(getattr(self, 'max_seq_len_cached', 0)) or 32768,
++                                 32768)
++                    pos = torch.arange(length, device=x.device, dtype=torch.float32)
++                    freqs = torch.outer(pos, self.inv_freq.to(x.device).float())
++                    emb = torch.cat((freqs, freqs), dim=-1)
++                    entry = ((emb.cos() * self.attention_scaling).to(x.dtype),
++                             (emb.sin() * self.attention_scaling).to(x.dtype))
++                    tables[key] = entry
++                cos_table, sin_table = entry
++                flat = position_ids.reshape(-1)
++                shape = (*position_ids.shape, cos_table.shape[-1])
++                return cos_table[flat].view(shape), sin_table[flat].view(shape)
++
++            patch(cls, 'forward', rope_forward)
++
++
++class _FastDecode:
++
++    def __init__(self, model):
++        self.model = model
++        self.cls = type(model)
++        self.undo = []
++        self.pool = {}
++        self.step_states = {}
++        self.disabled = False
++
++    def _patch(self, owner, attr, value):
++        self.undo.append((owner, attr, getattr(owner, attr)))
++        setattr(owner, attr, value)
++
++    def __enter__(self):
++        if not _ENABLED:
++            return self
++        try:
++            self._install()
++        except Exception as exc:                                  # noqa: BLE001
++            self.disabled = True
++            self._restore()
++            _warn('%s: %s' % (type(exc).__name__, exc))
++        return self
++
++    def __exit__(self, *exc_info):
++        self._restore()
++        return False
++
++    def remove(self):
++        self._restore()
++
++    def _restore(self):
++        while self.undo:
++            owner, attr, original = self.undo.pop()
++            setattr(owner, attr, original)
++        self.step_states.clear()
++        self.pool.clear()
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
++
++    def _install(self):
++        from transformers.cache_utils import StaticCache, StaticCacheConfig
++        from transformers.generation.utils import GenerationMixin
++
++        if not torch.cuda.is_available():
++            raise RuntimeError('no CUDA device')
++
++        config_init = StaticCacheConfig.__init__
++
++        def patched_config_init(cfg, batch_size=1, max_cache_len=1, *args, **kwargs):
++            config_init(cfg, batch_size, max_cache_len, *args, **kwargs)
++
++        self._patch(StaticCacheConfig, '__init__', patched_config_init)
++
++        original_get_cache = GenerationMixin._get_cache
++        pool, model = self.pool, self.model
++
++        def get_cache(mixin, cache_implementation, batch_size, max_cache_len, device,
++                      *args, **kwargs):
++            if cache_implementation != 'static':
++                return original_get_cache(mixin, cache_implementation, batch_size,
++                                          max_cache_len, device, *args, **kwargs)
++            key = (int(batch_size), int(max_cache_len))
++            cache = pool.get(key)
++            if cache is None:
++                try:
++                    cache = StaticCache(config=mixin.config, batch_size=key[0],
++                                        max_cache_len=key[1], device=device,
++                                        dtype=model.dtype)
++                except TypeError:
++                    cache = StaticCache(config=mixin.config, max_batch_size=key[0],
++                                        max_cache_len=key[1], device=device,
++                                        dtype=model.dtype)
++                pool[key] = cache
++            else:
++                cache.reset()
++            mixin._cache = cache
++            return cache
++
++        self._patch(GenerationMixin, '_get_cache', get_cache)
++
++        original_prepare = self.cls.prepare_inputs_for_generation
++
++        def prepare(module, input_ids, **kwargs):
++            out = original_prepare(module, input_ids, **kwargs)
++            given = kwargs.get('attention_mask')
++            got = out.get('attention_mask')
++            if given is not None and given.dim() == 2 and got is not None and got.dim() == 4:
++                out['attention_mask'] = given
++            return out
++
++        self._patch(self.cls, 'prepare_inputs_for_generation', prepare)
++
++        original_unfinished = GenerationMixin._has_unfinished_sequences
++
++        def has_unfinished(mixin, this_peer_finished, synced_gpus, device,
++                           cur_len=None, max_length=None):
++            if not synced_gpus and cur_len is not None and max_length is not None:
++                return cur_len < max_length
++            return original_unfinished(mixin, this_peer_finished, synced_gpus, device,
++                                       cur_len=cur_len, max_length=max_length)
++
++        self._patch(GenerationMixin, '_has_unfinished_sequences', has_unfinished)
++        _ensure_opt_model_paths(self.model, self._patch)
++        self._patch(self.cls, 'forward', self._make_forward())
++
++    def _make_forward(self):
++        from transformers.modeling_outputs import CausalLMOutputWithPast
++
++        original_forward = self.cls.forward
++        state_of = self.step_states
++        owner = self
++
++        def forward(module, input_ids=None, attention_mask=None, position_ids=None,
++                    past_key_values=None, inputs_embeds=None, labels=None,
++                    use_cache=None, output_attentions=None, output_hidden_states=None,
++                    return_dict=None, cache_position=None, num_logits_to_keep=0,
++                    **kwargs):
++
++            def eager():
++                return original_forward(
++                    module, input_ids=input_ids, attention_mask=attention_mask,
++                    position_ids=position_ids, past_key_values=past_key_values,
++                    inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
++                    output_attentions=output_attentions,
++                    output_hidden_states=output_hidden_states, return_dict=return_dict,
++                    cache_position=cache_position,
++                    num_logits_to_keep=num_logits_to_keep, **kwargs)
++
++            if (owner.disabled
++                    or input_ids is None or input_ids.dim() != 2
++                    or input_ids.shape[1] != 1
++                    or inputs_embeds is not None or labels is not None
++                    or output_attentions or output_hidden_states
++                    or past_key_values is None
++                    or type(past_key_values).__name__ != 'StaticCache'
++                    or cache_position is None or int(num_logits_to_keep) != 1):
++                return eager()
++
++            batch = int(input_ids.shape[0])
++            length = int(past_key_values.get_max_cache_shape())
++            key = (batch, length, id(past_key_values))
++            state = state_of.get(key)
++
++            if state is None:
++                try:
++                    state = owner._build_step(module, original_forward, input_ids,
++                                           attention_mask, past_key_values,
++                                           cache_position, key)
++                except Exception as exc:                          # noqa: BLE001
++                    owner.disabled = True
++                    _warn('%s: %s' % (type(exc).__name__, exc))
++                    return eager()
++                state_of[key] = state
++            else:
++                state['ids'].copy_(input_ids)
++                state['pos'].copy_(cache_position)
++                state['g'].replay()
++
++            return CausalLMOutputWithPast(logits=state['logits'],
++                                          past_key_values=past_key_values)
++
++        return forward
++
++    def _build_step(self, module, original_forward, input_ids, attention_mask,
++                 cache, cache_position, key):
++        batch, length = key[0], key[1]
++
++        if attention_mask is not None:
++            filled = int(cache_position.max().item()) + 1
++            if attention_mask.dim() == 4:
++                clean = bool((attention_mask[..., :filled] == 0).all())
++            else:
++                clean = bool(attention_mask[:, :filled].all())
++            if not clean:
++                raise RuntimeError('the batch is left-padded, so the decode mask '
++                                   'cannot be replaced by a constant one')
++
++        ids = input_ids.clone()
++        pos = cache_position.clone()
++        mask = torch.ones((batch, length), dtype=torch.long, device=input_ids.device)
++
++        def once():
++            return original_forward(module, input_ids=ids, attention_mask=mask,
++                                    past_key_values=cache, use_cache=True,
++                                    cache_position=pos, num_logits_to_keep=1,
++                                    return_dict=True)
++
++        reference = once().logits.detach().clone()
++
++        side = torch.cuda.Stream()
++        side.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(side):
++            for _ in range(3):
++                once()
++        torch.cuda.current_stream().wait_stream(side)
++        torch.cuda.synchronize()
++
++        g = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(g):
++            out = once()
++        g.replay()
++
++        scale = float(reference.abs().max()) or 1.0
++        drift = float((out.logits.float() - reference.float()).abs().max())
++        if drift > _TOLERANCE * scale:
++            raise RuntimeError('the optimized step disagrees with the stock forward '
++                               '(max delta %.3g against a scale of %.3g)' % (drift, scale))
++
++        return {'ids': ids, 'pos': pos, 'mask': mask, 'g': g,
++                'logits': out.logits}
++
++
++_ACTIVE = []
++
++
++def install(model):
++    helper = _FastDecode(model)
++    helper.__enter__()
++    _ACTIVE.append(helper)
++    return helper
++
++
++@contextlib.contextmanager
++def fast_decode(model):
++    helper = _FastDecode(model)
++    with helper:
++        yield helper
++
++
++def cache_implementation():
++    if not _ENABLED:
++        return None
++    if not _ACTIVE or _ACTIVE[-1].disabled or not _ACTIVE[-1].undo:
++        return None
++    return 'static'
+diff --git a/demo.py b/demo.py
+index 40569fe65eff996693ffb2caa678d5aa0eecf66f..7a7c015331fefcca1c6b2e18425992129079c3e9 100644
+--- a/demo.py
++++ b/demo.py
+@@ -1,3 +1,6 @@
++import argparse
++import os
++
+ import torch
+ from transformers import AutoTokenizer, AutoModelForCausalLM
+ import matplotlib.pyplot as plt
+@@ -7,70 +10,176 @@ import numpy as np
+ base_dir = './' # change to your hf model directory
+ device = "cuda" if torch.cuda.is_available() else "cpu"
+ 
+-# Loop through different model variants
+-for name in ['baseline', 'gate_elementwise', 'gate_headwise']:
+-    
+-    # Load model and tokenizer
+-    model_name_or_path = f"{base_dir}/1B_{name}"
++VARIANTS = ['baseline', 'gate_elementwise', 'gate_headwise']
++
++
++try:
++    import ao_fast_decode
++except ImportError:
++    ao_fast_decode = None
++
++_GENERATE_MODES = {'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': None}
++
++
++def _generate_dtype():
++    name = os.environ.get('GATED_ATTENTION_OPT_2', 'fp16').lower()
++    if name not in _GENERATE_MODES:
++        raise SystemExit('GATED_ATTENTION_OPT_2 must be one of: %s'
++                         % ', '.join(sorted(_GENERATE_MODES)))
++    return _GENERATE_MODES[name]
++
++
++def attention_map_demo():
++    # Loop through different model variants
++    for name in VARIANTS:
++
++        # Load model and tokenizer
++        model_name_or_path = f"{base_dir}/1B_{name}"
++        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
++        model = AutoModelForCausalLM.from_pretrained(model_name_or_path, trust_remote_code=True).to(device)
++
++        # Input text
++        prompt = "Sparse gating mechanism mitigates attention sink."
++        inputs = tokenizer(prompt, return_tensors="pt").to(device)
++
++        # Forward pass with output_attentions=True to retrieve attention scores
++        with torch.no_grad():
++            outputs = model(
++                input_ids=inputs["input_ids"],
++                attention_mask=inputs["attention_mask"],
++                output_attentions=True  # Retrieve attention scores
++            )
++
++        # Extract attention scores
++        attentions = outputs.attentions  # tuple of tensors: (layer) -> (batch, head, seq_len, seq_len)
++
++        # Function to average attention scores across all heads for each layer
++        def average_heads(attentions):
++            averaged = []
++            for layer_attn in attentions:
++                # layer_attn: (batch, head, seq_len, seq_len)
++                avg_attn = layer_attn.mean(dim=1).cpu().numpy()  # (batch, seq_len, seq_len)
++                averaged.append(avg_attn[0])  # Take the first sample
++            return averaged
++
++        averaged_attentions = average_heads(attentions)
++
++        # Get tokens for axis labels
++        tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
++
++        # Visualize attention maps of selected layers
++        layers_to_visualize = [0, 6, 20, 27]  # Python indices start at 0, corresponds to 1st, 7th, 21st, 28th layers
++        fig, axes = plt.subplots(2, 2, figsize=(14, 12))
++        axes = axes.flatten()
++
++        for idx, layer_idx in enumerate(layers_to_visualize):
++            attn_map = averaged_attentions[layer_idx]
++
++            # Plot attention map
++            ax = axes[idx]
++            im = ax.imshow(attn_map, cmap="viridis")
++
++            # Add colorbar
++            fig.colorbar(im, ax=ax)
++
++            # Set title
++            ax.set_title(f"Layer {layer_idx + 1}")
++
++            # Set ticks and labels
++            ax.set_xticks(np.arange(len(tokens)))
++            ax.set_yticks(np.arange(len(tokens)))
++            ax.set_xticklabels(tokens, rotation=90)
++            ax.set_yticklabels(tokens)
++
++            # Hide tick marks
++            ax.tick_params(axis='both', which='both', length=0)
++
++        plt.tight_layout()
++        plt.savefig(f"{name}_selected_layer_attention_maps.png")
++        plt.show()
++
++
++def read_prompts(path):
++    with open(path, encoding='utf-8') as handle:
++        return [line.rstrip('\n') for line in handle if line.strip()]
++
++
++def generate_demo(args):
++    model_name_or_path = f"{base_dir}/1B_{args.variant}"
+     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, trust_remote_code=True).to(device)
+-
+-    # Input text
+-    prompt = "Sparse gating mechanism mitigates attention sink."
+-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+-
+-    # Forward pass with output_attentions=True to retrieve attention scores
+-    with torch.no_grad():
+-        outputs = model(
+-            input_ids=inputs["input_ids"],
+-            attention_mask=inputs["attention_mask"],
+-            output_attentions=True  # Retrieve attention scores
+-        )
+-
+-    # Extract attention scores
+-    attentions = outputs.attentions  # tuple of tensors: (layer) -> (batch, head, seq_len, seq_len)
+-
+-    # Function to average attention scores across all heads for each layer
+-    def average_heads(attentions):
+-        averaged = []
+-        for layer_attn in attentions:
+-            # layer_attn: (batch, head, seq_len, seq_len)
+-            avg_attn = layer_attn.mean(dim=1).cpu().numpy()  # (batch, seq_len, seq_len)
+-            averaged.append(avg_attn[0])  # Take the first sample
+-        return averaged
+-
+-    averaged_attentions = average_heads(attentions)
+-
+-    # Get tokens for axis labels
+-    tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+-
+-    # Visualize attention maps of selected layers
+-    layers_to_visualize = [0, 6, 20, 27]  # Python indices start at 0, corresponds to 1st, 7th, 21st, 28th layers
+-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+-    axes = axes.flatten()
+-
+-    for idx, layer_idx in enumerate(layers_to_visualize):
+-        attn_map = averaged_attentions[layer_idx]
+-
+-        # Plot attention map
+-        ax = axes[idx]
+-        im = ax.imshow(attn_map, cmap="viridis")
+-
+-        # Add colorbar
+-        fig.colorbar(im, ax=ax)
+-
+-        # Set title
+-        ax.set_title(f"Layer {layer_idx + 1}")
+-
+-        # Set ticks and labels
+-        ax.set_xticks(np.arange(len(tokens)))
+-        ax.set_yticks(np.arange(len(tokens)))
+-        ax.set_xticklabels(tokens, rotation=90)
+-        ax.set_yticklabels(tokens)
+-
+-        # Hide tick marks
+-        ax.tick_params(axis='both', which='both', length=0)
+-
+-    plt.tight_layout()
+-    plt.savefig(f"{name}_selected_layer_attention_maps.png")
+-    plt.show()
++    if tokenizer.pad_token_id is None:
++        tokenizer.pad_token = tokenizer.eos_token
++    tokenizer.padding_side = 'left'
++    load_kwargs = {'trust_remote_code': True}
++    dtype = _generate_dtype()
++    if dtype is not None:
++        load_kwargs['torch_dtype'] = dtype
++    try:
++        model = AutoModelForCausalLM.from_pretrained(
++            model_name_or_path, device_map={'': device}, **load_kwargs)
++    except Exception:
++        model = AutoModelForCausalLM.from_pretrained(
++            model_name_or_path, **load_kwargs).to(device)
++    model.eval()
++    fast = ao_fast_decode.install(model) if ao_fast_decode else None
++    cache_impl = ao_fast_decode.cache_implementation() if ao_fast_decode else None
++
++    prompts = read_prompts(args.prompts)
++    size = max(1, args.batch_size)
++    batches = [prompts[i:i + size] for i in range(0, len(prompts), size)]
++    out_handle = open(args.out, 'w', encoding='utf-8')
++
++    for unit_index, batch_prompts in enumerate(batches):
++        inputs = tokenizer(batch_prompts, return_tensors='pt', padding=True).to(device)
++        with torch.no_grad():
++            sequences = model.generate(
++                input_ids=inputs['input_ids'],
++                attention_mask=inputs['attention_mask'],
++                max_new_tokens=args.max_new_tokens,
++                min_new_tokens=args.max_new_tokens,
++                do_sample=False,
++                num_beams=1,
++                use_cache=True,
++                cache_implementation=cache_impl,
++                pad_token_id=tokenizer.pad_token_id,
++            )
++        completions = tokenizer.batch_decode(
++            sequences[:, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
++        for completion in completions:
++            out_handle.write(completion.replace('\n', ' ') + '\n')
++        out_handle.flush()
++        print(f"[gen] unit {unit_index + 1}/{len(batches)}", flush=True)
++
++    out_handle.close()
++    if fast is not None:
++        fast.remove()
++    print(f"[gen] wrote {len(prompts)} completions to {args.out}")
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Gated-attention demo: attention maps (default) or batch text generation.")
++    parser.add_argument('--generate', action='store_true',
++                        help='generate text for a file of prompts instead of plotting attention maps')
++    parser.add_argument('--variant', default='gate_headwise', choices=VARIANTS,
++                        help='which checkpoint to generate with (--generate only)')
++    parser.add_argument('--prompts', default=None,
++                        help='text file with one prompt per line (--generate only)')
++    parser.add_argument('--max-new-tokens', type=int, default=96,
++                        help='tokens to generate per prompt (--generate only)')
++    parser.add_argument('--batch-size', type=int, default=1,
++                        help='prompts per generate call (--generate only)')
++    parser.add_argument('--out', default='generated_outputs.txt',
++                        help='where completions are written (--generate only)')
++    args = parser.parse_args()
++
++    if args.generate:
++        if not args.prompts:
++            parser.error('--generate needs --prompts FILE (one prompt per line)')
++        generate_demo(args)
++    else:
++        attention_map_demo()
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/modeling_qwen3.py b/modeling_qwen3.py
+index 4adc88d5c4f21091224e0689156fc16614cd9688..4f91fa1a680623f93bb721bc5fdf3fa1a8aff553 100644
+--- a/modeling_qwen3.py
++++ b/modeling_qwen3.py
+@@ -20,10 +20,12 @@
+ """PyTorch Qwen3 model."""
+ 
+ import math
++import os
+ from typing import List, Optional, Tuple, Union
+ 
+ import torch
+ import torch.utils.checkpoint
++import torch.nn.functional as F
+ from torch import nn
+ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+ 
+@@ -56,6 +58,8 @@ if is_flash_attn_2_available():
+ 
+ logger = logging.get_logger(__name__)
+ 
++_AO_FAST = os.environ.get("GATED_ATTENTION_FAST", "1") != "0"
++
+ _CHECKPOINT_FOR_DOC = "Qwen/Qwen3-8B"
+ _CONFIG_FOR_DOC = "Qwen3Config"
+ 
+@@ -71,6 +75,9 @@ class Qwen3RMSNorm(nn.Module):
+         self.variance_epsilon = eps
+ 
+     def forward(self, hidden_states):
++        if _AO_FAST and hasattr(F, "rms_norm"):
++            return F.rms_norm(hidden_states, (hidden_states.shape[-1],),
++                              self.weight, self.variance_epsilon)
+         input_dtype = hidden_states.dtype
+         hidden_states = hidden_states.to(torch.float32)
+         variance = hidden_states.pow(2).mean(-1, keepdim=True)
+@@ -147,6 +154,23 @@ class Qwen3RotaryEmbedding(nn.Module):
+ 
+     @torch.no_grad()
+     def forward(self, x, position_ids):
++        if _AO_FAST and "dynamic" not in self.rope_type:
++            key = (str(x.device), x.dtype)
++            table = getattr(self, "_ao_rope_table", None)
++            if table is None or key not in table:
++                length = min(int(getattr(self, "max_seq_len_cached", 0)) or 32768, 32768)
++                pos = torch.arange(length, device=x.device, dtype=torch.float32)
++                freqs = torch.outer(pos, self.inv_freq.to(x.device).float())
++                emb = torch.cat((freqs, freqs), dim=-1)
++                table = table if table is not None else {}
++                table[key] = ((emb.cos() * self.attention_scaling).to(x.dtype),
++                              (emb.sin() * self.attention_scaling).to(x.dtype))
++                self._ao_rope_table = table
++            cos_table, sin_table = table[key]
++            flat = position_ids.reshape(-1)
++            shape = (*position_ids.shape, cos_table.shape[-1])
++            return cos_table[flat].view(shape), sin_table[flat].view(shape)
++
+         if "dynamic" in self.rope_type:
+             self._dynamic_frequency_update(position_ids, device=x.device)
+ 
+@@ -497,7 +521,6 @@ class Qwen3FlashAttention2(Qwen3Attention):
+         return attn_output, attn_weights, past_key_value
+ 
+ 
+-
+ class Qwen3SdpaAttention(Qwen3Attention):
+     """
+     Qwen3 attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from

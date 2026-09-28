@@ -20,10 +20,12 @@
 """PyTorch Qwen3 model."""
 
 import math
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
+import torch.nn.functional as F
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
@@ -56,6 +58,8 @@ if is_flash_attn_2_available():
 
 logger = logging.get_logger(__name__)
 
+_AO_FAST = os.environ.get("GATED_ATTENTION_FAST", "1") != "0"
+
 _CHECKPOINT_FOR_DOC = "Qwen/Qwen3-8B"
 _CONFIG_FOR_DOC = "Qwen3Config"
 
@@ -71,6 +75,9 @@ class Qwen3RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        if _AO_FAST and hasattr(F, "rms_norm"):
+            return F.rms_norm(hidden_states, (hidden_states.shape[-1],),
+                              self.weight, self.variance_epsilon)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -147,6 +154,23 @@ class Qwen3RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, x, position_ids):
+        if _AO_FAST and "dynamic" not in self.rope_type:
+            key = (str(x.device), x.dtype)
+            table = getattr(self, "_ao_rope_table", None)
+            if table is None or key not in table:
+                length = min(int(getattr(self, "max_seq_len_cached", 0)) or 32768, 32768)
+                pos = torch.arange(length, device=x.device, dtype=torch.float32)
+                freqs = torch.outer(pos, self.inv_freq.to(x.device).float())
+                emb = torch.cat((freqs, freqs), dim=-1)
+                table = table if table is not None else {}
+                table[key] = ((emb.cos() * self.attention_scaling).to(x.dtype),
+                              (emb.sin() * self.attention_scaling).to(x.dtype))
+                self._ao_rope_table = table
+            cos_table, sin_table = table[key]
+            flat = position_ids.reshape(-1)
+            shape = (*position_ids.shape, cos_table.shape[-1])
+            return cos_table[flat].view(shape), sin_table[flat].view(shape)
+
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
 
@@ -495,7 +519,6 @@ class Qwen3FlashAttention2(Qwen3Attention):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
-
 
 
 class Qwen3SdpaAttention(Qwen3Attention):
